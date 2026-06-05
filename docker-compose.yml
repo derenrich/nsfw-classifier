@@ -5,6 +5,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        - HF_TOKEN=${HF_TOKEN:-}
     container_name: nsfw-classifier-server
     ports:
       - "8000:8000"

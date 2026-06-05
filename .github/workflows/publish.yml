@@ -62,6 +62,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
           # Utilizes GitHub Actions cache for faster subsequent builds
           cache-from: type=gha
           cache-to: type=gha,mode=max
