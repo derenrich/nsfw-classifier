@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  nsfw-classifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nsfw-classifier-server
+    ports:
+      - "8000:8000"
+    environment:
+      # Exposes all GPU devices to the container
+      - NVIDIA_VISIBLE_DEVICES=all
+      # Forces stdout and stderr to be unbuffered
+      - PYTHONUNBUFFERED=1
+      # Configures path translation from host machine to container's /datasets volume
+      - HOST_DATASET_PATH=${HOST_DATASET_PATH:-/home/user/my_datasets}
+      - CONTAINER_DATASET_PATH=/datasets
+    volumes:
+      # Maps the host's dataset directory to the container path /datasets
+      # Using interpolation ${HOST_DATASET_PATH} with fallback so it can be set in an .env file
+      - ${HOST_DATASET_PATH:-/home/user/my_datasets}:/datasets
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
