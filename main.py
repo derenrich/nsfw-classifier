@@ -140,17 +140,17 @@ async def health():
     }
 
 @app.get("/benchmark")
-async def run_benchmark():
+async def run_benchmark(width: int = 200, height: int = 300):
     """
-    Downloads a random sample image from Picsum, and benchmarks inference 
-    speeds across different batch sizes (1, 2, 4, 8, 16, 32).
+    Downloads a random sample image from Picsum with specified dimensions,
+    and benchmarks inference speeds across different batch sizes (up to 1024).
     """
     import io
     import time
     import urllib.request
     
-    url = "https://picsum.photos/200/300"
-    logger.info(f"Downloading benchmark image from {url}...")
+    url = f"https://picsum.photos/{width}/{height}"
+    logger.info(f"Downloading benchmark image ({width}x{height}) from {url}...")
     
     try:
         # Download image using standard library urllib
@@ -165,7 +165,8 @@ async def run_benchmark():
         logger.error(f"Failed to download benchmark image: {e}")
         return {"error": f"Failed to download benchmark image: {str(e)}"}
 
-    batch_sizes = [1, 2, 4, 8, 16, 32]
+    # Scan batch sizes up to 1024
+    batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
     results = []
     
     # Warmup run to compile graph / initialize CUDA context
@@ -203,6 +204,9 @@ async def run_benchmark():
                 "batch_size": size,
                 "error": f"Inference failed: {str(e)}"
             })
+            # Clean up GPU memory immediately if we hit an Out-Of-Memory (OOM) or other runtime error
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     return {
         "device": "cuda:0" if device == 0 else "cpu",
