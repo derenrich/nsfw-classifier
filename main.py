@@ -1,7 +1,7 @@
 import os
 import logging
 from typing import List, Dict, Any
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from PIL import Image
 import torch
@@ -89,7 +89,7 @@ def load_image(path_or_url: str) -> Image.Image:
         logger.info(f"Fetching remote image from URL: {path_or_url}")
         req = urllib.request.Request(
             path_or_url,
-            headers={'User-Agent': 'Mozilla/5.0'}
+            headers={'User-Agent': 'NSFWClassifierBot/1.0 (https://github.com/derenrich/nsfw-classifier; info@nsfw-classifier.local)'}
         )
         with urllib.request.urlopen(req, timeout=15) as response:
             img_data = response.read()
@@ -167,6 +167,111 @@ async def classify_batch_freepik(file_paths: List[str]):
     """
     return await classify_batch_generic(file_paths, classifier_freepik)
 
+def fetch_category_images(category_name: str, limit: int, thumb_width: int = 400) -> List[str]:
+    """
+    Queries the Wikimedia Commons API to get file thumbnail URLs for files in the given category.
+    Uses a policy-compliant User-Agent.
+    """
+    import json
+    import urllib.parse
+    import urllib.request
+
+    # Standardize category name structure
+    if not category_name.startswith("Category:"):
+        category_name = f"Category:{category_name}"
+
+    params = {
+        "action": "query",
+        "generator": "categorymembers",
+        "gcmtitle": category_name,
+        "gcmtype": "file",
+        "gcmlimit": str(limit),
+        "prop": "imageinfo",
+        "iiprop": "url",
+        "iiurlwidth": str(thumb_width),
+        "format": "json"
+    }
+    
+    query_string = urllib.parse.urlencode(params)
+    url = f"https://commons.wikimedia.org/w/api.php?{query_string}"
+    
+    logger.info(f"Querying Wikimedia Commons Category API: {url}")
+    
+    req = urllib.request.Request(
+        url,
+        headers={
+            # Policy-compliant User-Agent including contact details and github URL:
+            # https://meta.wikimedia.org/wiki/User-Agent_policy
+            'User-Agent': 'NSFWClassifierBot/1.0 (https://github.com/derenrich/nsfw-classifier; info@nsfw-classifier.local) Python-urllib/3'
+        }
+    )
+    
+    with urllib.request.urlopen(req, timeout=15) as response:
+        data = json.loads(response.read().decode("utf-8"))
+        
+    pages = data.get("query", {}).get("pages", {})
+    image_urls = []
+    
+    for page_id, page_info in pages.items():
+        imageinfo = page_info.get("imageinfo", [])
+        if imageinfo:
+            # Optimally fetch thumbnail URL
+            thumb_url = imageinfo[0].get("thumburl")
+            if thumb_url:
+                image_urls.append(thumb_url)
+            else:
+                # Fallback to the original URL if thumburl isn't present
+                original_url = imageinfo[0].get("url")
+                if original_url:
+                    image_urls.append(original_url)
+                    
+    # API query results can sometimes exceed our limit if generator returns slightly more items
+    return image_urls[:limit]
+
+class CategoryClassificationResponse(BaseModel):
+    category: str
+    model_used: str
+    results: List[ClassificationResult]
+
+@app.get("/classify-category", response_model=CategoryClassificationResponse)
+async def classify_category(category: str, limit: int = 10, model: str = "falconsai"):
+    """
+    Fetches image thumbnail URLs from a specified Wikimedia Commons category,
+    runs batch inference using the specified model, and returns classification data.
+    """
+    model_lower = model.lower()
+    if model_lower == "falconsai":
+        classifier_pipeline = classifier_falconsai
+        model_name = MODEL_FALCONSAI
+    elif model_lower == "freepik":
+        classifier_pipeline = classifier_freepik
+        model_name = MODEL_FREEPIK
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid model '{model}'. Supported options: 'falconsai', 'freepik'.")
+        
+    try:
+        # Fetch thumbnail URLs from Wikimedia Commons
+        image_urls = fetch_category_images(category, limit)
+    except Exception as e:
+        logger.error(f"Wikimedia API query failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch category images from Wikimedia: {str(e)}")
+        
+    if not image_urls:
+        return CategoryClassificationResponse(
+            category=category,
+            model_used=model_name,
+            results=[]
+        )
+        
+    # Run batch classification on the fetched thumbnail URLs
+    results = await classify_batch_generic(image_urls, classifier_pipeline)
+    
+    return CategoryClassificationResponse(
+        category=category,
+        model_used=model_name,
+        results=results
+    )
+
 @app.get("/health")
 async def health():
     """
@@ -211,7 +316,7 @@ async def run_benchmark(width: int = 200, height: int = 300, model: str = "falco
         # Download image using standard library urllib
         req = urllib.request.Request(
             url, 
-            headers={'User-Agent': 'Mozilla/5.0'}
+            headers={'User-Agent': 'NSFWClassifierBot/1.0 (https://github.com/derenrich/nsfw-classifier; info@nsfw-classifier.local)'}
         )
         with urllib.request.urlopen(req, timeout=10) as response:
             img_data = response.read()
