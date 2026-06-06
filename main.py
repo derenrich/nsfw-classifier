@@ -79,6 +79,46 @@ def translate_path(host_path: str) -> str:
     # Fallback to the original path if it doesn't match the expected prefix
     return host_path_clean
 
+import time
+import threading
+
+class RateLimiter:
+    """
+    A thread-safe sliding window rate limiter that blocks (waiting/retrying)
+    until a request slot is available for external resources.
+    """
+    def __init__(self, max_requests: int, period_seconds: float):
+        self.max_requests = max_requests
+        self.period_seconds = period_seconds
+        self.timestamps = []
+        self.lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """
+        Acquires a request slot, blocking/sleeping if the rate limit is exceeded
+        until a slot opens up.
+        """
+        with self.lock:
+            while True:
+                now = time.time()
+                self.timestamps = [t for t in self.timestamps if now - t < self.period_seconds]
+                
+                if len(self.timestamps) < self.max_requests:
+                    self.timestamps.append(now)
+                    return
+                
+                sleep_time = self.timestamps[0] + self.period_seconds - now
+                if sleep_time > 0:
+                    logger.info(f"Rate limit for external images reached. Waiting {sleep_time:.2f}s to retry...")
+                    self.lock.release()
+                    try:
+                        time.sleep(sleep_time)
+                    finally:
+                        self.lock.acquire()
+
+# Rate limit external image downloads to 20 requests per 30 seconds
+external_image_limiter = RateLimiter(max_requests=20, period_seconds=30.0)
+
 def load_image(path_or_url: str) -> Image.Image:
     """
     Loads an image from a local host path (translated to container path) or fetches it from a remote URL.
@@ -87,6 +127,9 @@ def load_image(path_or_url: str) -> Image.Image:
     import urllib.request
 
     if path_or_url.startswith(("http://", "https://")):
+        # Blocks and waits if rate limit is reached
+        external_image_limiter.acquire()
+        
         logger.info(f"Fetching remote image from URL: {path_or_url}")
         req = urllib.request.Request(
             path_or_url,
@@ -110,9 +153,13 @@ async def classify_batch_generic(path_or_urls: List[str], classifier_pipeline) -
     valid_images = []
     valid_indices = []
     
+    import asyncio
+    loop = asyncio.get_running_loop()
+    
     for idx, path_or_url in enumerate(path_or_urls):
         try:
-            img = load_image(path_or_url)
+            # Run blocking load_image in a separate thread so it doesn't freeze the main event loop
+            img = await loop.run_in_executor(None, load_image, path_or_url)
             valid_images.append(img)
             valid_indices.append(idx)
         except Exception as e:
@@ -380,14 +427,9 @@ async def run_benchmark(width: int = 200, height: int = 300, model: str = "falco
     logger.info(f"Downloading benchmark image ({width}x{height}) for model {model_name} from {url}...")
     
     try:
-        # Download image using standard library urllib
-        req = urllib.request.Request(
-            url, 
-            headers={'User-Agent': 'NSFWClassifierBot/1.0 (https://github.com/derenrich/nsfw-classifier; info@nsfw-classifier.local)'}
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            img_data = response.read()
-        img = Image.open(io.BytesIO(img_data)).convert("RGB")
+        import asyncio
+        loop = asyncio.get_running_loop()
+        img = await loop.run_in_executor(None, load_image, url)
     except Exception as e:
         logger.error(f"Failed to download benchmark image: {e}")
         return {"error": f"Failed to download benchmark image: {str(e)}"}
