@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# Use official PyTorch runtime image with CUDA 12.4 and cuDNN 9
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+# Use official PyTorch runtime image from GHCR (PyTorch 2.12.0, CUDA 12.6, cuDNN 9)
+FROM ghcr.io/pytorch/pytorch:2.12.0-cuda12.6-cudnn9-runtime
 
 # Set environment variables
 # PYTHONDONTWRITEBYTECODE: Prevents Python from writing .pyc files
