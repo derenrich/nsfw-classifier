@@ -6,9 +6,11 @@ FROM ghcr.io/pytorch/pytorch:2.12.0-cuda12.6-cudnn9-runtime
 # PYTHONDONTWRITEBYTECODE: Prevents Python from writing .pyc files
 # PYTHONUNBUFFERED: Prevents Python from buffering stdout/stderr (crucial for docker logs)
 # HF_HOME: Defines the cache directory for Hugging Face models
+# PIP_BREAK_SYSTEM_PACKAGES: Allows pip installs in PEP 668 managed container environments
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HF_HOME=/app/hf_cache
+    HF_HOME=/app/hf_cache \
+    PIP_BREAK_SYSTEM_PACKAGES=1
 
 # Set working directory inside the container
 WORKDIR /app
