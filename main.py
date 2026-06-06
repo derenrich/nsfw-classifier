@@ -2,6 +2,7 @@ import os
 import logging
 from typing import List, Dict, Any
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from PIL import Image
 import torch
@@ -167,9 +168,9 @@ async def classify_batch_freepik(file_paths: List[str]):
     """
     return await classify_batch_generic(file_paths, classifier_freepik)
 
-def fetch_category_images(category_name: str, limit: int, thumb_width: int = 400) -> List[str]:
+def fetch_category_images(category_name: str, limit: int, thumb_width: int = 400) -> List[Dict[str, str]]:
     """
-    Queries the Wikimedia Commons API to get file thumbnail URLs for files in the given category.
+    Queries the Wikimedia Commons API to get file titles and thumbnail URLs.
     Uses a policy-compliant User-Agent.
     """
     import json
@@ -210,67 +211,133 @@ def fetch_category_images(category_name: str, limit: int, thumb_width: int = 400
         data = json.loads(response.read().decode("utf-8"))
         
     pages = data.get("query", {}).get("pages", {})
-    image_urls = []
+    results = []
     
     for page_id, page_info in pages.items():
+        title = page_info.get("title", "")
         imageinfo = page_info.get("imageinfo", [])
         if imageinfo:
             # Optimally fetch thumbnail URL
             thumb_url = imageinfo[0].get("thumburl")
-            if thumb_url:
-                image_urls.append(thumb_url)
-            else:
-                # Fallback to the original URL if thumburl isn't present
-                original_url = imageinfo[0].get("url")
-                if original_url:
-                    image_urls.append(original_url)
+            original_url = imageinfo[0].get("url")
+            url_to_use = thumb_url if thumb_url else original_url
+            if title and url_to_use:
+                results.append({
+                    "title": title,
+                    "url": url_to_use
+                })
                     
     # API query results can sometimes exceed our limit if generator returns slightly more items
-    return image_urls[:limit]
+    return results[:limit]
 
-class CategoryClassificationResponse(BaseModel):
-    category: str
-    model_used: str
-    results: List[ClassificationResult]
-
-@app.get("/classify-category", response_model=CategoryClassificationResponse)
-async def classify_category(category: str, limit: int = 10, model: str = "falconsai"):
+@app.get("/classify-category", response_class=PlainTextResponse)
+async def classify_category(category: str, limit: int = 10, model: str = "all"):
     """
-    Fetches image thumbnail URLs from a specified Wikimedia Commons category,
-    runs batch inference using the specified model, and returns classification data.
+    Fetches images from a specified Wikimedia Commons category, runs batch inference
+    on Falconsai, Freepik, or both models, and returns the results formatted
+    as a sortable MediaWiki wikitext table.
     """
     model_lower = model.lower()
-    if model_lower == "falconsai":
-        classifier_pipeline = classifier_falconsai
-        model_name = MODEL_FALCONSAI
-    elif model_lower == "freepik":
-        classifier_pipeline = classifier_freepik
-        model_name = MODEL_FREEPIK
-    else:
-        raise HTTPException(status_code=400, detail=f"Invalid model '{model}'. Supported options: 'falconsai', 'freepik'.")
-        
+    if model_lower not in ("all", "falconsai", "freepik"):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid model '{model}'. Supported options: 'all', 'falconsai', 'freepik'."
+        )
+
     try:
-        # Fetch thumbnail URLs from Wikimedia Commons
-        image_urls = fetch_category_images(category, limit)
+        # Fetch metadata and thumbnail URLs from Wikimedia Commons
+        category_files = fetch_category_images(category, limit)
     except Exception as e:
         logger.error(f"Wikimedia API query failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch category images from Wikimedia: {str(e)}")
+
+    if not category_files:
+        return f"No files found in category: {category}"
+
+    # Extract URLs to pass to batch classification
+    urls = [file_info["url"] for file_info in category_files]
+
+    # Run classification for models based on selection
+    falconsai_results = None
+    freepik_results = None
+
+    if model_lower in ("all", "falconsai"):
+        logger.info("Running Falconsai model classification...")
+        falconsai_results = await classify_batch_generic(urls, classifier_falconsai)
+
+    if model_lower in ("all", "freepik"):
+        logger.info("Running Freepik model classification...")
+        freepik_results = await classify_batch_generic(urls, classifier_freepik)
+
+    # Helper function to format predictions into a MediaWiki table cell markup
+    def get_cell_markup(result) -> str:
+        if not result or result.error:
+            err_msg = f"Error: {result.error}" if result else "N/A"
+            return f'style="background-color: #f6f8fa; color: #6a737d;" data-sort-value="-1.00000" | {err_msg}'
+        if not result.predictions:
+            return 'style="background-color: #f6f8fa; color: #6a737d;" data-sort-value="-1.00000" | No predictions'
+            
+        predictions = result.predictions
+        if hasattr(predictions, "dict"):
+            predictions = predictions.dict()
+            
+        top_pred = max(predictions, key=lambda x: x.get('score', 0.0) if isinstance(x, dict) else getattr(x, 'score', 0.0))
+        label = top_pred.get('label', 'unknown') if isinstance(top_pred, dict) else getattr(top_pred, 'label', 'unknown')
+        score = top_pred.get('score', 0.0) if isinstance(top_pred, dict) else getattr(top_pred, 'score', 0.0)
+        display_text = f"{label} ({score * 100:.1f}%)"
         
-    if not image_urls:
-        return CategoryClassificationResponse(
-            category=category,
-            model_used=model_name,
-            results=[]
-        )
+        # Calculate NSFW score for sorting (higher score = more NSFW)
+        nsfw_score = None
+        for p in predictions:
+            p_label = p.get('label', '') if isinstance(p, dict) else getattr(p, 'label', '')
+            p_score = p.get('score', 0.0) if isinstance(p, dict) else getattr(p, 'score', 0.0)
+            if "nsfw" in p_label.lower():
+                nsfw_score = p_score
+                break
+        if nsfw_score is None:
+            if label.lower() in ('normal', 'sfw', 'safe', 's'):
+                nsfw_score = 1.0 - score
+            else:
+                nsfw_score = score
+                
+        is_nsfw = label.lower() == 'nsfw' or ('nsfw' in label.lower() and label.lower() != 'sfw')
         
-    # Run batch classification on the fetched thumbnail URLs
-    results = await classify_batch_generic(image_urls, classifier_pipeline)
+        if is_nsfw:
+            style = 'style="background-color: #ffeef0; color: #d73a49; font-weight: bold;"'
+        else:
+            style = 'style="background-color: #e6ffed; color: #22863a;"'
+            
+        return f'{style} data-sort-value="{nsfw_score:.5f}" | {display_text}'
+
+    # Construct sortable wikitext table
+    wikitext = []
+    wikitext.append('{| class="wikitable sortable"')
+    wikitext.append(f'|+ NSFW Classification Comparison for {category}')
+    wikitext.append('|-')
     
-    return CategoryClassificationResponse(
-        category=category,
-        model_used=model_name,
-        results=results
-    )
+    # Header row (Image column is unsortable to make the table clean)
+    if model_lower == "all":
+        wikitext.append('! class="unsortable" | Image !! Falconsai Prediction !! Freepik Prediction')
+    elif model_lower == "falconsai":
+        wikitext.append('! class="unsortable" | Image !! Falconsai Prediction')
+    elif model_lower == "freepik":
+        wikitext.append('! class="unsortable" | Image !! Freepik Prediction')
+
+    # Data rows
+    for i, file_info in enumerate(category_files):
+        wikitext.append('|-')
+        # Cell 1: MediaWiki image markup using file title
+        wikitext.append(f'| [[{file_info["title"]}|100px]]')
+        
+        if falconsai_results is not None:
+            wikitext.append(f'| {get_cell_markup(falconsai_results[i])}')
+            
+        if freepik_results is not None:
+            wikitext.append(f'| {get_cell_markup(freepik_results[i])}')
+
+    wikitext.append('|}')
+    
+    return '\n'.join(wikitext)
 
 @app.get("/health")
 async def health():
