@@ -1,5 +1,6 @@
-# Use official PyTorch runtime image with CUDA 12.1 and cuDNN 9
-FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+# syntax=docker/dockerfile:1
+# Use official PyTorch runtime image with CUDA 12.4 and cuDNN 9
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 # Set environment variables
 # PYTHONDONTWRITEBYTECODE: Prevents Python from writing .pyc files
@@ -20,13 +21,10 @@ COPY requirements.txt .
 # PyTorch is already pre-installed in the base image, so pip will skip downloading it.
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Add build argument for Hugging Face authentication (required for gated/restricted models)
-ARG HF_TOKEN
-
 # Pre-download and cache Hugging Face model weights during build phase.
-# We pass the HF_TOKEN to this step so we can access restricted models.
-# By setting it only for this RUN step, we avoid baking the token into the image's runtime env.
-RUN HF_TOKEN=$HF_TOKEN python -c "from transformers import pipeline; pipeline('image-classification', model='Falconsai/nsfw_image_detection_26')"
+# We mount the HF_TOKEN secret securely so it is not leaked in the image metadata/history.
+RUN --mount=type=secret,id=HF_TOKEN \
+    HF_TOKEN=$(cat /run/secrets/HF_TOKEN) python -c "from transformers import pipeline; pipeline('image-classification', model='Falconsai/nsfw_image_detection_26')"
 
 # Copy the application code
 COPY main.py .
