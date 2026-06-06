@@ -9,12 +9,14 @@ services:
         - HF_TOKEN
     container_name: nsfw-classifier-server
     ports:
-      - "8000:8000"
+      - "${PORT:-8000}:${PORT:-8000}"
     environment:
       # Exposes all GPU devices to the container
       - NVIDIA_VISIBLE_DEVICES=all
       # Forces stdout and stderr to be unbuffered
       - PYTHONUNBUFFERED=1
+      # Configures the port uvicorn runs on inside the container
+      - PORT=${PORT:-8000}
       # Configures path translation from host machine to container's /datasets volume
       - HOST_DATASET_PATH=${HOST_DATASET_PATH:-/home/user/my_datasets}
       - CONTAINER_DATASET_PATH=/datasets
