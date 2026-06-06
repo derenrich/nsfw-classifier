@@ -32,15 +32,26 @@ if device == 0:
 else:
     logger.warning("CUDA GPU not available. Running on CPU.")
 
-# Initialize Hugging Face pipeline
-# Falconsai/nsfw_image_detection_26 is a ViT-based image classification model
-MODEL_NAME = "Falconsai/nsfw_image_detection_26"
-logger.info(f"Loading pipeline for model: {MODEL_NAME}...")
+# Initialize Hugging Face pipelines
+# Model 1: Falconsai/nsfw_image_detection_26
+MODEL_FALCONSAI = "Falconsai/nsfw_image_detection_26"
+# Model 2: Freepik/nsfw_image_detector
+MODEL_FREEPIK = "Freepik/nsfw_image_detector"
+
+logger.info(f"Loading pipeline for model: {MODEL_FALCONSAI}...")
 try:
-    classifier = pipeline("image-classification", model=MODEL_NAME, device=device)
-    logger.info("Pipeline loaded successfully.")
+    classifier_falconsai = pipeline("image-classification", model=MODEL_FALCONSAI, device=device)
+    logger.info("Falconsai pipeline loaded successfully.")
 except Exception as e:
-    logger.error(f"Error loading pipeline: {e}")
+    logger.error(f"Error loading Falconsai pipeline: {e}")
+    raise e
+
+logger.info(f"Loading pipeline for model: {MODEL_FREEPIK}...")
+try:
+    classifier_freepik = pipeline("image-classification", model=MODEL_FREEPIK, device=device)
+    logger.info("Freepik pipeline loaded successfully.")
+except Exception as e:
+    logger.error(f"Error loading Freepik pipeline: {e}")
     raise e
 
 class ClassificationResult(BaseModel):
@@ -67,39 +78,47 @@ def translate_path(host_path: str) -> str:
     # Fallback to the original path if it doesn't match the expected prefix
     return host_path_clean
 
-@app.post("/classify-batch", response_model=List[ClassificationResult])
-async def classify_batch(file_paths: List[str]):
+def load_image(path_or_url: str) -> Image.Image:
     """
-    Accepts a list of absolute file paths on the host system,
-    translates them to container paths, loads valid images,
-    runs batched GPU inference, and returns predictions.
+    Loads an image from a local host path (translated to container path) or fetches it from a remote URL.
     """
-    results = [ClassificationResult(file_path=path) for path in file_paths]
+    import io
+    import urllib.request
+
+    if path_or_url.startswith(("http://", "https://")):
+        logger.info(f"Fetching remote image from URL: {path_or_url}")
+        req = urllib.request.Request(
+            path_or_url,
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            img_data = response.read()
+        return Image.open(io.BytesIO(img_data)).convert("RGB")
+    else:
+        container_path = translate_path(path_or_url)
+        if not os.path.exists(container_path):
+            raise FileNotFoundError(f"File not found on container system (mapped from: {path_or_url})")
+        return Image.open(container_path).convert("RGB")
+
+async def classify_batch_generic(path_or_urls: List[str], classifier_pipeline) -> List[ClassificationResult]:
+    """
+    Generic runner for loading images/URLs and executing batched pipeline classification.
+    """
+    results = [ClassificationResult(file_path=path) for path in path_or_urls]
     
-    # Store images and map them back to their original indexes in the request list
     valid_images = []
     valid_indices = []
     
-    for idx, host_path in enumerate(file_paths):
-        container_path = translate_path(host_path)
-        
-        if not os.path.exists(container_path):
-            error_msg = f"File not found in container. Host path: {host_path} -> Translated container path: {container_path}"
-            logger.warning(error_msg)
-            results[idx].error = error_msg
-            continue
-            
+    for idx, path_or_url in enumerate(path_or_urls):
         try:
-            # Load and convert image to RGB (pipeline requires RGB)
-            img = Image.open(container_path).convert("RGB")
+            img = load_image(path_or_url)
             valid_images.append(img)
             valid_indices.append(idx)
         except Exception as e:
-            error_msg = f"Error loading image: {str(e)}"
-            logger.error(f"{error_msg} (Path: {container_path})")
+            error_msg = f"Failed to load image: {str(e)}"
+            logger.error(f"{error_msg} (Input: {path_or_url})")
             results[idx].error = error_msg
 
-    # If we have valid images, run batched inference
     if valid_images:
         try:
             # We use a batch size of up to 16 to optimize GPU throughput
@@ -107,7 +126,7 @@ async def classify_batch(file_paths: List[str]):
             logger.info(f"Running inference on a batch of {len(valid_images)} images with batch_size={batch_size}")
             
             # The Hugging Face pipeline handles batching automatically when passed a list of PIL Images
-            predictions = classifier(valid_images, batch_size=batch_size)
+            predictions = classifier_pipeline(valid_images, batch_size=batch_size)
             
             # If batch_size=1 and only 1 image, some pipeline versions return a dict instead of list of lists
             if len(valid_images) == 1 and not isinstance(predictions, list):
@@ -123,6 +142,30 @@ async def classify_batch(file_paths: List[str]):
                 results[valid_idx].error = error_msg
 
     return results
+
+@app.post("/classify-batch", response_model=List[ClassificationResult])
+async def classify_batch_default(file_paths: List[str]):
+    """
+    Accepts a list of absolute host file paths or URLs, runs batched inference
+    using the default model (Falconsai/nsfw_image_detection_26).
+    """
+    return await classify_batch_generic(file_paths, classifier_falconsai)
+
+@app.post("/classify-batch/falconsai", response_model=List[ClassificationResult])
+async def classify_batch_falconsai(file_paths: List[str]):
+    """
+    Accepts a list of absolute host file paths or URLs, runs batched inference
+    using Falconsai/nsfw_image_detection_26.
+    """
+    return await classify_batch_generic(file_paths, classifier_falconsai)
+
+@app.post("/classify-batch/freepik", response_model=List[ClassificationResult])
+async def classify_batch_freepik(file_paths: List[str]):
+    """
+    Accepts a list of absolute host file paths or URLs, runs batched inference
+    using Freepik/nsfw_image_detector.
+    """
+    return await classify_batch_generic(file_paths, classifier_freepik)
 
 @app.get("/health")
 async def health():
@@ -140,17 +183,29 @@ async def health():
     }
 
 @app.get("/benchmark")
-async def run_benchmark(width: int = 200, height: int = 300):
+async def run_benchmark(width: int = 200, height: int = 300, model: str = "falconsai"):
     """
     Downloads a random sample image from Picsum with specified dimensions,
-    and benchmarks inference speeds across different batch sizes (up to 1024).
+    and benchmarks inference speeds across different batch sizes (up to 1024)
+    using the specified model ('falconsai' or 'freepik').
     """
     import io
     import time
     import urllib.request
     
+    # Select target classifier pipeline
+    model_lower = model.lower()
+    if model_lower == "falconsai":
+        classifier_pipeline = classifier_falconsai
+        model_name = MODEL_FALCONSAI
+    elif model_lower == "freepik":
+        classifier_pipeline = classifier_freepik
+        model_name = MODEL_FREEPIK
+    else:
+        return {"error": f"Invalid model '{model}'. Supported options: 'falconsai', 'freepik'."}
+
     url = f"https://picsum.photos/{width}/{height}"
-    logger.info(f"Downloading benchmark image ({width}x{height}) from {url}...")
+    logger.info(f"Downloading benchmark image ({width}x{height}) for model {model_name} from {url}...")
     
     try:
         # Download image using standard library urllib
@@ -171,12 +226,12 @@ async def run_benchmark(width: int = 200, height: int = 300):
     
     # Warmup run to compile graph / initialize CUDA context
     try:
-        classifier([img], batch_size=1)
+        classifier_pipeline([img], batch_size=1)
     except Exception as e:
         logger.error(f"Warmup inference failed: {e}")
         return {"error": f"Warmup inference failed: {str(e)}"}
 
-    logger.info("Starting GPU batch size benchmark runs...")
+    logger.info(f"Starting GPU batch size benchmark runs for {model_name}...")
     for size in batch_sizes:
         # Replicate image to build the batch
         batch = [img] * size
@@ -184,7 +239,7 @@ async def run_benchmark(width: int = 200, height: int = 300):
         start_time = time.perf_counter()
         try:
             # Run inference
-            classifier(batch, batch_size=size)
+            classifier_pipeline(batch, batch_size=size)
             end_time = time.perf_counter()
             
             elapsed = end_time - start_time
@@ -211,6 +266,7 @@ async def run_benchmark(width: int = 200, height: int = 300):
     return {
         "device": "cuda:0" if device == 0 else "cpu",
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "model_benchmarked": model_name,
         "image_size": f"{img.width}x{img.height}",
         "benchmark_results": results
     }

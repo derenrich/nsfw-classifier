@@ -26,7 +26,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Pre-download and cache Hugging Face model weights during build phase.
 # We mount the HF_TOKEN secret securely so it is not leaked in the image metadata/history.
 RUN --mount=type=secret,id=HF_TOKEN \
-    HF_TOKEN=$(cat /run/secrets/HF_TOKEN) python -c "from transformers import pipeline; pipeline('image-classification', model='Falconsai/nsfw_image_detection_26')"
+    HF_TOKEN=$(cat /run/secrets/HF_TOKEN) python -c "\
+from transformers import pipeline; \
+pipeline('image-classification', model='Falconsai/nsfw_image_detection_26'); \
+pipeline('image-classification', model='Freepik/nsfw_image_detector')\
+"
 
 # Copy the application code
 COPY main.py .
