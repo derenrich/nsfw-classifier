@@ -1,5 +1,5 @@
-# Use official PyTorch runtime image with CUDA 12.1 and cuDNN 8
-FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+# Use official PyTorch runtime image with CUDA 12.1 and cuDNN 9
+FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
 
 # Set environment variables
 # PYTHONDONTWRITEBYTECODE: Prevents Python from writing .pyc files
