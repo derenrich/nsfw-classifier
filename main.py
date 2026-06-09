@@ -79,6 +79,54 @@ def translate_path(host_path: str) -> str:
     # Fallback to the original path if it doesn't match the expected prefix
     return host_path_clean
 
+def translate_path_back(container_path: str) -> str:
+    """
+    Translates an absolute file path inside the container back to its corresponding
+    path on the host system based on volume mapping configuration.
+    """
+    container_path_clean = os.path.normpath(container_path)
+    container_prefix_clean = os.path.normpath(CONTAINER_DATASET_PATH)
+    
+    if container_path_clean.startswith(container_prefix_clean):
+        relative_path = os.path.relpath(container_path_clean, container_prefix_clean)
+        if not relative_path.startswith(".."):
+            host_path = os.path.join(HOST_DATASET_PATH, relative_path)
+            return os.path.normpath(host_path)
+            
+    return container_path_clean
+
+def expand_paths(paths: List[str]) -> List[str]:
+    """
+    Expands any local paths containing wildcards (globbing) inside the container
+    and translates them back to host paths.
+    """
+    import glob
+    expanded = []
+    
+    for path in paths:
+        if path.startswith(("http://", "https://")):
+            expanded.append(path)
+            continue
+            
+        # Check if the path contains wildcard characters
+        if any(char in path for char in ("*", "?", "[")):
+            container_pattern = translate_path(path)
+            matches = glob.glob(container_pattern, recursive=True)
+            if matches:
+                matches.sort()
+                for match in matches:
+                    # Only include files (ignore directories found by globbing)
+                    if os.path.isfile(match):
+                        expanded.append(translate_path_back(match))
+            else:
+                # If no matches found, keep the original path so it generates a failure in the response
+                expanded.append(path)
+        else:
+            # No wildcards, keep the original path
+            expanded.append(path)
+            
+    return expanded
+
 import time
 import threading
 
@@ -117,7 +165,7 @@ class RateLimiter:
                         self.lock.acquire()
 
 # Rate limit external image downloads to 20 requests per 30 seconds
-external_image_limiter = RateLimiter(max_requests=20, period_seconds=30.0)
+external_image_limiter = RateLimiter(max_requests=20, period_seconds=40.0)
 
 def load_image(path_or_url: str) -> Image.Image:
     """
@@ -148,7 +196,10 @@ async def classify_batch_generic(path_or_urls: List[str], classifier_pipeline) -
     """
     Generic runner for loading images/URLs and executing batched pipeline classification.
     """
-    results = [ClassificationResult(file_path=path) for path in path_or_urls]
+    # Expand any glob patterns in the path list
+    expanded_paths = expand_paths(path_or_urls)
+    
+    results = [ClassificationResult(file_path=path) for path in expanded_paths]
     
     valid_images = []
     valid_indices = []
@@ -156,7 +207,7 @@ async def classify_batch_generic(path_or_urls: List[str], classifier_pipeline) -
     import asyncio
     loop = asyncio.get_running_loop()
     
-    for idx, path_or_url in enumerate(path_or_urls):
+    for idx, path_or_url in enumerate(expanded_paths):
         try:
             # Run blocking load_image in a separate thread so it doesn't freeze the main event loop
             img = await loop.run_in_executor(None, load_image, path_or_url)
