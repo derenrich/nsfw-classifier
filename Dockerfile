@@ -29,7 +29,8 @@ RUN --mount=type=secret,id=HF_TOKEN \
     HF_TOKEN=$(cat /run/secrets/HF_TOKEN) python -c "\
 from transformers import pipeline; \
 pipeline('image-classification', model='Falconsai/nsfw_image_detection_26'); \
-pipeline('image-classification', model='Freepik/nsfw_image_detector')\
+pipeline('image-classification', model='Freepik/nsfw_image_detector'); \
+pipeline('image-classification', model='derenrich/private_detector_hf', trust_remote_code=True)\
 "
 
 # Copy the application code

@@ -38,6 +38,8 @@ else:
 MODEL_FALCONSAI = "Falconsai/nsfw_image_detection_26"
 # Model 2: Freepik/nsfw_image_detector
 MODEL_FREEPIK = "Freepik/nsfw_image_detector"
+# Model 3: Ported Private Detector model
+MODEL_PRIVATE_DETECTOR = "derenrich/private_detector_hf"
 
 logger.info(f"Loading pipeline for model: {MODEL_FALCONSAI}...")
 try:
@@ -53,6 +55,19 @@ try:
     logger.info("Freepik pipeline loaded successfully.")
 except Exception as e:
     logger.error(f"Error loading Freepik pipeline: {e}")
+    raise e
+
+logger.info(f"Loading pipeline for model: {MODEL_PRIVATE_DETECTOR}...")
+try:
+    classifier_private_detector = pipeline(
+        "image-classification",
+        model=MODEL_PRIVATE_DETECTOR,
+        device=device,
+        trust_remote_code=True
+    )
+    logger.info("Private Detector pipeline loaded successfully.")
+except Exception as e:
+    logger.error(f"Error loading Private Detector pipeline: {e}")
     raise e
 
 class ClassificationResult(BaseModel):
@@ -266,6 +281,14 @@ async def classify_batch_freepik(file_paths: List[str]):
     """
     return await classify_batch_generic(file_paths, classifier_freepik)
 
+@app.post("/classify-batch/private-detector", response_model=List[ClassificationResult])
+async def classify_batch_private_detector(file_paths: List[str]):
+    """
+    Accepts a list of absolute host file paths or URLs, runs batched inference
+    using the ported Private Detector model.
+    """
+    return await classify_batch_generic(file_paths, classifier_private_detector)
+
 def fetch_category_images(category_name: str, limit: int, thumb_width: int = 400) -> List[Dict[str, str]]:
     """
     Queries the Wikimedia Commons API to get file titles and thumbnail URLs.
@@ -336,10 +359,10 @@ async def classify_category(category: str, limit: int = 10, model: str = "all"):
     as a sortable MediaWiki wikitext table.
     """
     model_lower = model.lower()
-    if model_lower not in ("all", "falconsai", "freepik"):
+    if model_lower not in ("all", "falconsai", "freepik", "private-detector"):
         raise HTTPException(
             status_code=400, 
-            detail=f"Invalid model '{model}'. Supported options: 'all', 'falconsai', 'freepik'."
+            detail=f"Invalid model '{model}'. Supported options: 'all', 'falconsai', 'freepik', 'private-detector'."
         )
 
     try:
@@ -358,6 +381,7 @@ async def classify_category(category: str, limit: int = 10, model: str = "all"):
     # Run classification for models based on selection
     falconsai_results = None
     freepik_results = None
+    private_detector_results = None
 
     if model_lower in ("all", "falconsai"):
         logger.info("Running Falconsai model classification...")
@@ -366,6 +390,10 @@ async def classify_category(category: str, limit: int = 10, model: str = "all"):
     if model_lower in ("all", "freepik"):
         logger.info("Running Freepik model classification...")
         freepik_results = await classify_batch_generic(urls, classifier_freepik)
+
+    if model_lower in ("all", "private-detector"):
+        logger.info("Running Private Detector model classification...")
+        private_detector_results = await classify_batch_generic(urls, classifier_private_detector)
 
     # Helper function to format predictions into a MediaWiki table cell markup
     def get_cell_markup(result) -> str:
@@ -415,11 +443,13 @@ async def classify_category(category: str, limit: int = 10, model: str = "all"):
     
     # Header row (Image column is unsortable to make the table clean)
     if model_lower == "all":
-        wikitext.append('! class="unsortable" | Image !! Falconsai Prediction !! Freepik Prediction')
+        wikitext.append('! class="unsortable" | Image !! Falconsai Prediction !! Freepik Prediction !! Private Detector Prediction')
     elif model_lower == "falconsai":
         wikitext.append('! class="unsortable" | Image !! Falconsai Prediction')
     elif model_lower == "freepik":
         wikitext.append('! class="unsortable" | Image !! Freepik Prediction')
+    elif model_lower == "private-detector":
+        wikitext.append('! class="unsortable" | Image !! Private Detector Prediction')
 
     # Data rows
     for i, file_info in enumerate(category_files):
@@ -432,6 +462,9 @@ async def classify_category(category: str, limit: int = 10, model: str = "all"):
             
         if freepik_results is not None:
             wikitext.append(f'| {get_cell_markup(freepik_results[i])}')
+
+        if private_detector_results is not None:
+            wikitext.append(f'| {get_cell_markup(private_detector_results[i])}')
 
     wikitext.append('|}')
     
@@ -471,8 +504,11 @@ async def run_benchmark(width: int = 200, height: int = 300, model: str = "falco
     elif model_lower == "freepik":
         classifier_pipeline = classifier_freepik
         model_name = MODEL_FREEPIK
+    elif model_lower == "private-detector":
+        classifier_pipeline = classifier_private_detector
+        model_name = MODEL_PRIVATE_DETECTOR
     else:
-        return {"error": f"Invalid model '{model}'. Supported options: 'falconsai', 'freepik'."}
+        return {"error": f"Invalid model '{model}'. Supported options: 'falconsai', 'freepik', 'private-detector'."}
 
     url = f"https://picsum.photos/{width}/{height}"
     logger.info(f"Downloading benchmark image ({width}x{height}) for model {model_name} from {url}...")
