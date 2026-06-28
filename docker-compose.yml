@@ -20,10 +20,14 @@ services:
       # Configures path translation from host machine to container's /datasets volume
       - HOST_DATASET_PATH=${HOST_DATASET_PATH:-/home/user/my_datasets}
       - CONTAINER_DATASET_PATH=/datasets
+      # SQLite score cache (set to empty string to disable)
+      - SCORE_CACHE_DB=${SCORE_CACHE_DB:-/app/cache/scores.db}
     volumes:
       # Maps the host's dataset directory to the container path /datasets
       # Using interpolation ${HOST_DATASET_PATH} with fallback so it can be set in an .env file
       - ${HOST_DATASET_PATH:-/home/user/my_datasets}:/datasets
+      # Persistent volume for the score cache database
+      - nsfw-cache:/app/cache
     deploy:
       resources:
         reservations:
@@ -32,6 +36,9 @@ services:
               count: 1
               capabilities: [gpu]
     restart: unless-stopped
+
+volumes:
+  nsfw-cache:
 
 secrets:
   HF_TOKEN:

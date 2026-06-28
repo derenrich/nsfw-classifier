@@ -1,12 +1,14 @@
 import os
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from PIL import Image
 import torch
 from transformers import pipeline
+
+from cache import ScoreCache
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -69,6 +71,18 @@ try:
 except Exception as e:
     logger.error(f"Error loading Private Detector pipeline: {e}")
     raise e
+
+# ---------------------------------------------------------------------------
+# Score cache (SQLite)  —  controlled by SCORE_CACHE_DB env var
+# ---------------------------------------------------------------------------
+SCORE_CACHE_DB = os.getenv("SCORE_CACHE_DB", "")
+if SCORE_CACHE_DB:
+    score_cache: Optional[ScoreCache] = ScoreCache(SCORE_CACHE_DB)
+    if score_cache._disabled:
+        score_cache = None
+else:
+    score_cache = None
+    logger.info("Score cache is disabled (SCORE_CACHE_DB not set)")
 
 class ClassificationResult(BaseModel):
     file_path: str
@@ -207,14 +221,34 @@ def load_image(path_or_url: str) -> Image.Image:
             raise FileNotFoundError(f"File not found on container system (mapped from: {path_or_url})")
         return Image.open(container_path).convert("RGB")
 
-async def classify_batch_generic(path_or_urls: List[str], classifier_pipeline) -> List[ClassificationResult]:
+async def classify_batch_generic(path_or_urls: List[str], classifier_pipeline, model_name: str = "") -> List[ClassificationResult]:
     """
     Generic runner for loading images/URLs and executing batched pipeline classification.
+    URL-based requests are served from / written to the score cache when enabled.
     """
     # Expand any glob patterns in the path list
     expanded_paths = expand_paths(path_or_urls)
     
     results = [ClassificationResult(file_path=path) for path in expanded_paths]
+    
+    # Resolve model name for cache keying
+    if not model_name:
+        try:
+            model_name = classifier_pipeline.model.name_or_path
+        except Exception:
+            model_name = "unknown"
+    
+    # --- Cache lookup (URLs only) ---
+    cached_indices: set = set()
+    if score_cache is not None:
+        for idx, path_or_url in enumerate(expanded_paths):
+            if path_or_url.startswith(("http://", "https://")):
+                cached = score_cache.get(path_or_url, model_name)
+                if cached is not None:
+                    results[idx].predictions = cached
+                    cached_indices.add(idx)
+        if cached_indices:
+            logger.info(f"Score cache: {len(cached_indices)} hit(s) out of {len(expanded_paths)} item(s)")
     
     valid_images = []
     valid_indices = []
@@ -223,6 +257,8 @@ async def classify_batch_generic(path_or_urls: List[str], classifier_pipeline) -
     loop = asyncio.get_running_loop()
     
     for idx, path_or_url in enumerate(expanded_paths):
+        if idx in cached_indices:
+            continue
         try:
             # Run blocking load_image in a separate thread so it doesn't freeze the main event loop
             img = await loop.run_in_executor(None, load_image, path_or_url)
@@ -249,6 +285,15 @@ async def classify_batch_generic(path_or_urls: List[str], classifier_pipeline) -
             # Populate predictions back to the correct original indices
             for valid_idx, pred in zip(valid_indices, predictions):
                 results[valid_idx].predictions = pred
+                # --- Cache write (URLs only) ---
+                if score_cache is not None and expanded_paths[valid_idx].startswith(("http://", "https://")):
+                    # Normalize predictions to plain dicts for JSON serialization
+                    serializable = [
+                        {"label": p.get("label", "") if isinstance(p, dict) else getattr(p, "label", ""),
+                         "score": p.get("score", 0.0) if isinstance(p, dict) else getattr(p, "score", 0.0)}
+                        for p in pred
+                    ]
+                    score_cache.put(expanded_paths[valid_idx], model_name, serializable)
         except Exception as e:
             error_msg = f"Inference failure: {str(e)}"
             logger.critical(error_msg)
@@ -263,7 +308,7 @@ async def classify_batch_default(file_paths: List[str]):
     Accepts a list of absolute host file paths or URLs, runs batched inference
     using the default model (Falconsai/nsfw_image_detection_26).
     """
-    return await classify_batch_generic(file_paths, classifier_falconsai)
+    return await classify_batch_generic(file_paths, classifier_falconsai, MODEL_FALCONSAI)
 
 @app.post("/classify-batch/falconsai", response_model=List[ClassificationResult])
 async def classify_batch_falconsai(file_paths: List[str]):
@@ -271,7 +316,7 @@ async def classify_batch_falconsai(file_paths: List[str]):
     Accepts a list of absolute host file paths or URLs, runs batched inference
     using Falconsai/nsfw_image_detection_26.
     """
-    return await classify_batch_generic(file_paths, classifier_falconsai)
+    return await classify_batch_generic(file_paths, classifier_falconsai, MODEL_FALCONSAI)
 
 @app.post("/classify-batch/freepik", response_model=List[ClassificationResult])
 async def classify_batch_freepik(file_paths: List[str]):
@@ -279,7 +324,7 @@ async def classify_batch_freepik(file_paths: List[str]):
     Accepts a list of absolute host file paths or URLs, runs batched inference
     using Freepik/nsfw_image_detector.
     """
-    return await classify_batch_generic(file_paths, classifier_freepik)
+    return await classify_batch_generic(file_paths, classifier_freepik, MODEL_FREEPIK)
 
 @app.post("/classify-batch/private-detector", response_model=List[ClassificationResult])
 async def classify_batch_private_detector(file_paths: List[str]):
@@ -287,7 +332,7 @@ async def classify_batch_private_detector(file_paths: List[str]):
     Accepts a list of absolute host file paths or URLs, runs batched inference
     using the ported Private Detector model.
     """
-    return await classify_batch_generic(file_paths, classifier_private_detector)
+    return await classify_batch_generic(file_paths, classifier_private_detector, MODEL_PRIVATE_DETECTOR)
 
 def fetch_category_images(category_name: str, limit: int, thumb_width: int = 400) -> List[Dict[str, str]]:
     """
@@ -385,15 +430,15 @@ async def classify_category(category: str, limit: int = 10, model: str = "all"):
 
     if model_lower in ("all", "falconsai"):
         logger.info("Running Falconsai model classification...")
-        falconsai_results = await classify_batch_generic(urls, classifier_falconsai)
+        falconsai_results = await classify_batch_generic(urls, classifier_falconsai, MODEL_FALCONSAI)
 
     if model_lower in ("all", "freepik"):
         logger.info("Running Freepik model classification...")
-        freepik_results = await classify_batch_generic(urls, classifier_freepik)
+        freepik_results = await classify_batch_generic(urls, classifier_freepik, MODEL_FREEPIK)
 
     if model_lower in ("all", "private-detector"):
         logger.info("Running Private Detector model classification...")
-        private_detector_results = await classify_batch_generic(urls, classifier_private_detector)
+        private_detector_results = await classify_batch_generic(urls, classifier_private_detector, MODEL_PRIVATE_DETECTOR)
 
     # Helper function to format predictions into a MediaWiki table cell markup
     def get_cell_markup(result) -> str:
@@ -473,17 +518,27 @@ async def classify_category(category: str, limit: int = 10, model: str = "all"):
 @app.get("/health")
 async def health():
     """
-    Health check endpoint returning system status and GPU details.
+    Health check endpoint returning system status, GPU details, and cache stats.
     """
     gpu_available = torch.cuda.is_available()
-    return {
+    health_payload = {
         "status": "healthy",
         "gpu_available": gpu_available,
         "gpu_name": torch.cuda.get_device_name(0) if gpu_available else None,
         "device_allocated": "cuda:0" if device == 0 else "cpu",
         "host_dataset_path": HOST_DATASET_PATH,
-        "container_dataset_path": CONTAINER_DATASET_PATH
+        "container_dataset_path": CONTAINER_DATASET_PATH,
     }
+    if score_cache is not None:
+        health_payload["score_cache"] = {
+            "enabled": True,
+            "db_path": score_cache.db_path,
+            "hits": score_cache.hits,
+            "misses": score_cache.misses,
+        }
+    else:
+        health_payload["score_cache"] = {"enabled": False}
+    return health_payload
 
 @app.get("/benchmark")
 async def run_benchmark(width: int = 200, height: int = 300, model: str = "falconsai"):
