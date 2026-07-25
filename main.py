@@ -221,10 +221,19 @@ def load_image(path_or_url: str) -> Image.Image:
             raise FileNotFoundError(f"File not found on container system (mapped from: {path_or_url})")
         return Image.open(container_path).convert("RGB")
 
-async def classify_batch_generic(path_or_urls: List[str], classifier_pipeline, model_name: str = "") -> List[ClassificationResult]:
+async def classify_batch_generic(
+    path_or_urls: List[str],
+    classifier_pipeline,
+    model_name: str = "",
+    preloaded_images: Optional[Dict[int, Image.Image]] = None,
+) -> List[ClassificationResult]:
     """
     Generic runner for loading images/URLs and executing batched pipeline classification.
     URL-based requests are served from / written to the score cache when enabled.
+
+    If *preloaded_images* is provided it should map expanded-path indices to
+    already-loaded PIL Images, allowing callers to avoid redundant downloads
+    when the same image set is scored by multiple models.
     """
     # Expand any glob patterns in the path list
     expanded_paths = expand_paths(path_or_urls)
@@ -260,8 +269,12 @@ async def classify_batch_generic(path_or_urls: List[str], classifier_pipeline, m
         if idx in cached_indices:
             continue
         try:
-            # Run blocking load_image in a separate thread so it doesn't freeze the main event loop
-            img = await loop.run_in_executor(None, load_image, path_or_url)
+            # Use a pre-loaded image if available, otherwise download/load
+            if preloaded_images is not None and idx in preloaded_images:
+                img = preloaded_images[idx]
+            else:
+                # Run blocking load_image in a separate thread so it doesn't freeze the main event loop
+                img = await loop.run_in_executor(None, load_image, path_or_url)
             valid_images.append(img)
             valid_indices.append(idx)
         except Exception as e:
@@ -396,22 +409,220 @@ def fetch_category_images(category_name: str, limit: int, thumb_width: int = 400
     # API query results can sometimes exceed our limit if generator returns slightly more items
     return results[:limit]
 
+def fetch_article_images(article_title: str, thumb_width: int = 400) -> List[Dict[str, str]]:
+    """
+    Queries the Wikipedia REST API media-list endpoint to get all images
+    embedded in an English Wikipedia article.  Returns a list of dicts with
+    ``title`` (the ``File:`` page title) and ``url`` (a thumbnail URL).
+
+    Uses a policy-compliant User-Agent.
+    """
+    import json
+    import urllib.parse
+    import urllib.request
+
+    encoded_title = urllib.parse.quote(article_title, safe="")
+    api_url = f"https://en.wikipedia.org/api/rest_v1/page/media-list/{encoded_title}"
+
+    logger.info(f"Querying Wikipedia media-list API: {api_url}")
+
+    req = urllib.request.Request(
+        api_url,
+        headers={
+            'User-Agent': 'NSFWClassifierBot/1.0 (https://github.com/derenrich/nsfw-classifier; info@nsfw-classifier.local) Python-urllib/3'
+        }
+    )
+
+    with urllib.request.urlopen(req, timeout=15) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    results = []
+    for item in data.get("items", []):
+        # Only process image-type media (skip audio, video, etc.)
+        if item.get("type") != "image":
+            continue
+
+        title = item.get("title", "")
+        srcset = item.get("srcset", [])
+        if not srcset:
+            continue
+
+        # Pick the 1x scale thumbnail; fall back to the first entry
+        url = None
+        for entry in srcset:
+            if entry.get("scale") == "1x":
+                url = entry.get("src")
+                break
+        if url is None:
+            url = srcset[0].get("src")
+
+        if not url:
+            continue
+
+        # srcset URLs are protocol-relative (e.g. //upload.wikimedia.org/...)
+        if url.startswith("//"):
+            url = "https:" + url
+
+        if title:
+            results.append({"title": title, "url": url})
+
+    return results
+
+# ---------------------------------------------------------------------------
+# Shared helpers for multi-model classification + wikitext rendering
+# ---------------------------------------------------------------------------
+
+async def _preload_images(urls: List[str]) -> Dict[int, Image.Image]:
+    """Download a list of URLs once and return an index→PIL.Image mapping."""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    preloaded: Dict[int, Image.Image] = {}
+    for idx, url in enumerate(urls):
+        try:
+            img = await loop.run_in_executor(None, load_image, url)
+            preloaded[idx] = img
+        except Exception as e:
+            logger.error(f"Failed to pre-download image: {e} (URL: {url})")
+    logger.info(f"Pre-downloaded {len(preloaded)}/{len(urls)} images")
+    return preloaded
+
+
+async def _run_multi_model_classification(
+    urls: List[str],
+    model_selection: str,
+    preloaded: Dict[int, Image.Image],
+) -> tuple:
+    """Run classification on *urls* for the selected model(s).
+
+    Returns ``(falconsai_results, freepik_results, private_detector_results)``
+    where any unselected model is ``None``.
+    """
+    falconsai_results = None
+    freepik_results = None
+    private_detector_results = None
+
+    if model_selection in ("all", "falconsai"):
+        logger.info("Running Falconsai model classification...")
+        falconsai_results = await classify_batch_generic(urls, classifier_falconsai, MODEL_FALCONSAI, preloaded)
+
+    if model_selection in ("all", "freepik"):
+        logger.info("Running Freepik model classification...")
+        freepik_results = await classify_batch_generic(urls, classifier_freepik, MODEL_FREEPIK, preloaded)
+
+    if model_selection in ("all", "private-detector"):
+        logger.info("Running Private Detector model classification...")
+        private_detector_results = await classify_batch_generic(urls, classifier_private_detector, MODEL_PRIVATE_DETECTOR, preloaded)
+
+    return falconsai_results, freepik_results, private_detector_results
+
+
+def _get_cell_markup(result) -> str:
+    """Format a single ClassificationResult into a MediaWiki table cell."""
+    if not result or result.error:
+        err_msg = f"Error: {result.error}" if result else "N/A"
+        return f'style="background-color: #f6f8fa; color: #6a737d;" data-sort-value="-1.00000" | {err_msg}'
+    if not result.predictions:
+        return 'style="background-color: #f6f8fa; color: #6a737d;" data-sort-value="-1.00000" | No predictions'
+
+    predictions = result.predictions
+    if hasattr(predictions, "dict"):
+        predictions = predictions.dict()
+
+    top_pred = max(predictions, key=lambda x: x.get('score', 0.0) if isinstance(x, dict) else getattr(x, 'score', 0.0))
+    label = top_pred.get('label', 'unknown') if isinstance(top_pred, dict) else getattr(top_pred, 'label', 'unknown')
+    score = top_pred.get('score', 0.0) if isinstance(top_pred, dict) else getattr(top_pred, 'score', 0.0)
+    display_text = f"{label} ({score * 100:.1f}%)"
+
+    # Calculate NSFW score for sorting (higher score = more NSFW)
+    nsfw_score = None
+    for p in predictions:
+        p_label = p.get('label', '') if isinstance(p, dict) else getattr(p, 'label', '')
+        p_score = p.get('score', 0.0) if isinstance(p, dict) else getattr(p, 'score', 0.0)
+        if "nsfw" in p_label.lower():
+            nsfw_score = p_score
+            break
+    if nsfw_score is None:
+        if label.lower() in ('normal', 'sfw', 'safe', 's'):
+            nsfw_score = 1.0 - score
+        else:
+            nsfw_score = score
+
+    is_nsfw = label.lower() == 'nsfw' or ('nsfw' in label.lower() and label.lower() != 'sfw')
+
+    if is_nsfw:
+        style = 'style="background-color: #ffeef0; color: #d73a49; font-weight: bold;"'
+    else:
+        style = 'style="background-color: #e6ffed; color: #22863a;"'
+
+    return f'{style} data-sort-value="{nsfw_score:.5f}" | {display_text}'
+
+
+def _render_wikitext_table(
+    caption: str,
+    file_infos: List[Dict[str, str]],
+    model_selection: str,
+    falconsai_results,
+    freepik_results,
+    private_detector_results,
+) -> str:
+    """Build a sortable MediaWiki wikitext table from classification results."""
+    wikitext = []
+    wikitext.append('{| class="wikitable sortable"')
+    wikitext.append(f'|+ {caption}')
+    wikitext.append('|-')
+
+    # Header row (Image column is unsortable to make the table clean)
+    if model_selection == "all":
+        wikitext.append('! class="unsortable" | Image !! Falconsai Prediction !! Freepik Prediction !! Private Detector Prediction')
+    elif model_selection == "falconsai":
+        wikitext.append('! class="unsortable" | Image !! Falconsai Prediction')
+    elif model_selection == "freepik":
+        wikitext.append('! class="unsortable" | Image !! Freepik Prediction')
+    elif model_selection == "private-detector":
+        wikitext.append('! class="unsortable" | Image !! Private Detector Prediction')
+
+    # Data rows
+    for i, file_info in enumerate(file_infos):
+        wikitext.append('|-')
+        # Cell 1: MediaWiki image markup using file title
+        wikitext.append(f'| [[{file_info["title"]}|100px]]')
+
+        if falconsai_results is not None:
+            wikitext.append(f'| {_get_cell_markup(falconsai_results[i])}')
+
+        if freepik_results is not None:
+            wikitext.append(f'| {_get_cell_markup(freepik_results[i])}')
+
+        if private_detector_results is not None:
+            wikitext.append(f'| {_get_cell_markup(private_detector_results[i])}')
+
+    wikitext.append('|}')
+    return '\n'.join(wikitext)
+
+
+def _validate_model_param(model: str) -> str:
+    """Normalise and validate the model query parameter."""
+    model_lower = model.lower()
+    if model_lower not in ("all", "falconsai", "freepik", "private-detector"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid model '{model}'. Supported options: 'all', 'falconsai', 'freepik', 'private-detector'."
+        )
+    return model_lower
+
+# ---------------------------------------------------------------------------
+# Endpoints: classify-category & classify-article
+# ---------------------------------------------------------------------------
+
 @app.get("/classify-category", response_class=PlainTextResponse)
 async def classify_category(category: str, limit: int = 10, model: str = "all"):
     """
     Fetches images from a specified Wikimedia Commons category, runs batch inference
-    on Falconsai, Freepik, or both models, and returns the results formatted
-    as a sortable MediaWiki wikitext table.
+    on the selected model(s), and returns results as a sortable MediaWiki wikitext table.
     """
-    model_lower = model.lower()
-    if model_lower not in ("all", "falconsai", "freepik", "private-detector"):
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Invalid model '{model}'. Supported options: 'all', 'falconsai', 'freepik', 'private-detector'."
-        )
+    model_lower = _validate_model_param(model)
 
     try:
-        # Fetch metadata and thumbnail URLs from Wikimedia Commons
         category_files = fetch_category_images(category, limit)
     except Exception as e:
         logger.error(f"Wikimedia API query failed: {e}")
@@ -420,100 +631,50 @@ async def classify_category(category: str, limit: int = 10, model: str = "all"):
     if not category_files:
         return f"No files found in category: {category}"
 
-    # Extract URLs to pass to batch classification
     urls = [file_info["url"] for file_info in category_files]
+    preloaded = await _preload_images(urls)
+    falconsai_results, freepik_results, private_detector_results = await _run_multi_model_classification(urls, model_lower, preloaded)
 
-    # Run classification for models based on selection
-    falconsai_results = None
-    freepik_results = None
-    private_detector_results = None
+    return _render_wikitext_table(
+        caption=f"NSFW Classification Comparison for {category}",
+        file_infos=category_files,
+        model_selection=model_lower,
+        falconsai_results=falconsai_results,
+        freepik_results=freepik_results,
+        private_detector_results=private_detector_results,
+    )
 
-    if model_lower in ("all", "falconsai"):
-        logger.info("Running Falconsai model classification...")
-        falconsai_results = await classify_batch_generic(urls, classifier_falconsai, MODEL_FALCONSAI)
 
-    if model_lower in ("all", "freepik"):
-        logger.info("Running Freepik model classification...")
-        freepik_results = await classify_batch_generic(urls, classifier_freepik, MODEL_FREEPIK)
+@app.get("/classify-article", response_class=PlainTextResponse)
+async def classify_article(title: str, model: str = "all"):
+    """
+    Fetches all images embedded in an English Wikipedia article, runs batch
+    inference on the selected model(s), and returns results as a sortable
+    MediaWiki wikitext table.
+    """
+    model_lower = _validate_model_param(model)
 
-    if model_lower in ("all", "private-detector"):
-        logger.info("Running Private Detector model classification...")
-        private_detector_results = await classify_batch_generic(urls, classifier_private_detector, MODEL_PRIVATE_DETECTOR)
+    try:
+        article_files = fetch_article_images(title)
+    except Exception as e:
+        logger.error(f"Wikipedia media-list API query failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch article images from Wikipedia: {str(e)}")
 
-    # Helper function to format predictions into a MediaWiki table cell markup
-    def get_cell_markup(result) -> str:
-        if not result or result.error:
-            err_msg = f"Error: {result.error}" if result else "N/A"
-            return f'style="background-color: #f6f8fa; color: #6a737d;" data-sort-value="-1.00000" | {err_msg}'
-        if not result.predictions:
-            return 'style="background-color: #f6f8fa; color: #6a737d;" data-sort-value="-1.00000" | No predictions'
-            
-        predictions = result.predictions
-        if hasattr(predictions, "dict"):
-            predictions = predictions.dict()
-            
-        top_pred = max(predictions, key=lambda x: x.get('score', 0.0) if isinstance(x, dict) else getattr(x, 'score', 0.0))
-        label = top_pred.get('label', 'unknown') if isinstance(top_pred, dict) else getattr(top_pred, 'label', 'unknown')
-        score = top_pred.get('score', 0.0) if isinstance(top_pred, dict) else getattr(top_pred, 'score', 0.0)
-        display_text = f"{label} ({score * 100:.1f}%)"
-        
-        # Calculate NSFW score for sorting (higher score = more NSFW)
-        nsfw_score = None
-        for p in predictions:
-            p_label = p.get('label', '') if isinstance(p, dict) else getattr(p, 'label', '')
-            p_score = p.get('score', 0.0) if isinstance(p, dict) else getattr(p, 'score', 0.0)
-            if "nsfw" in p_label.lower():
-                nsfw_score = p_score
-                break
-        if nsfw_score is None:
-            if label.lower() in ('normal', 'sfw', 'safe', 's'):
-                nsfw_score = 1.0 - score
-            else:
-                nsfw_score = score
-                
-        is_nsfw = label.lower() == 'nsfw' or ('nsfw' in label.lower() and label.lower() != 'sfw')
-        
-        if is_nsfw:
-            style = 'style="background-color: #ffeef0; color: #d73a49; font-weight: bold;"'
-        else:
-            style = 'style="background-color: #e6ffed; color: #22863a;"'
-            
-        return f'{style} data-sort-value="{nsfw_score:.5f}" | {display_text}'
+    if not article_files:
+        return f"No images found in article: {title}"
 
-    # Construct sortable wikitext table
-    wikitext = []
-    wikitext.append('{| class="wikitable sortable"')
-    wikitext.append(f'|+ NSFW Classification Comparison for {category}')
-    wikitext.append('|-')
-    
-    # Header row (Image column is unsortable to make the table clean)
-    if model_lower == "all":
-        wikitext.append('! class="unsortable" | Image !! Falconsai Prediction !! Freepik Prediction !! Private Detector Prediction')
-    elif model_lower == "falconsai":
-        wikitext.append('! class="unsortable" | Image !! Falconsai Prediction')
-    elif model_lower == "freepik":
-        wikitext.append('! class="unsortable" | Image !! Freepik Prediction')
-    elif model_lower == "private-detector":
-        wikitext.append('! class="unsortable" | Image !! Private Detector Prediction')
+    urls = [file_info["url"] for file_info in article_files]
+    preloaded = await _preload_images(urls)
+    falconsai_results, freepik_results, private_detector_results = await _run_multi_model_classification(urls, model_lower, preloaded)
 
-    # Data rows
-    for i, file_info in enumerate(category_files):
-        wikitext.append('|-')
-        # Cell 1: MediaWiki image markup using file title
-        wikitext.append(f'| [[{file_info["title"]}|100px]]')
-        
-        if falconsai_results is not None:
-            wikitext.append(f'| {get_cell_markup(falconsai_results[i])}')
-            
-        if freepik_results is not None:
-            wikitext.append(f'| {get_cell_markup(freepik_results[i])}')
-
-        if private_detector_results is not None:
-            wikitext.append(f'| {get_cell_markup(private_detector_results[i])}')
-
-    wikitext.append('|}')
-    
-    return '\n'.join(wikitext)
+    return _render_wikitext_table(
+        caption=f"NSFW Classification for article: {title}",
+        file_infos=article_files,
+        model_selection=model_lower,
+        falconsai_results=falconsai_results,
+        freepik_results=freepik_results,
+        private_detector_results=private_detector_results,
+    )
 
 @app.get("/health")
 async def health():
