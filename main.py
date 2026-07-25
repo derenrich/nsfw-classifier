@@ -472,46 +472,90 @@ def fetch_article_images(article_title: str, thumb_width: int = 400) -> List[Dic
 # Shared helpers for multi-model classification + wikitext rendering
 # ---------------------------------------------------------------------------
 
-async def _preload_images(urls: List[str]) -> Dict[int, Image.Image]:
-    """Download a list of URLs once and return an index→PIL.Image mapping."""
+async def _preload_images(
+    urls: List[str],
+    skip_indices: Optional[set] = None,
+) -> Dict[int, Image.Image]:
+    """Download a list of URLs once and return an index→PIL.Image mapping.
+
+    Indices in *skip_indices* are not downloaded (e.g. because the score
+    cache already covers them for every model that will run).
+    """
     import asyncio
     loop = asyncio.get_running_loop()
     preloaded: Dict[int, Image.Image] = {}
+    skipped = 0
     for idx, url in enumerate(urls):
+        if skip_indices and idx in skip_indices:
+            skipped += 1
+            continue
         try:
             img = await loop.run_in_executor(None, load_image, url)
             preloaded[idx] = img
         except Exception as e:
             logger.error(f"Failed to pre-download image: {e} (URL: {url})")
-    logger.info(f"Pre-downloaded {len(preloaded)}/{len(urls)} images")
+    logger.info(
+        f"Pre-downloaded {len(preloaded)}/{len(urls)} images"
+        + (f" (skipped {skipped} already cached)" if skipped else "")
+    )
     return preloaded
 
 
 async def _run_multi_model_classification(
     urls: List[str],
     model_selection: str,
-    preloaded: Dict[int, Image.Image],
 ) -> tuple:
     """Run classification on *urls* for the selected model(s).
+
+    Checks the score cache **before** downloading any images so that
+    fully-cached URLs are never fetched from the network.  Only URLs
+    that require inference for at least one selected model are downloaded.
 
     Returns ``(falconsai_results, freepik_results, private_detector_results)``
     where any unselected model is ``None``.
     """
+    # Determine which (model_name, pipeline) pairs will run
+    models_to_run: List[tuple] = []
+    if model_selection in ("all", "falconsai"):
+        models_to_run.append((MODEL_FALCONSAI, classifier_falconsai))
+    if model_selection in ("all", "freepik"):
+        models_to_run.append((MODEL_FREEPIK, classifier_freepik))
+    if model_selection in ("all", "private-detector"):
+        models_to_run.append((MODEL_PRIVATE_DETECTOR, classifier_private_detector))
+
+    # Find URLs that are already cached for *every* selected model —
+    # those can be skipped entirely during image pre-downloading.
+    fully_cached_indices: set = set()
+    if score_cache is not None:
+        for idx, url in enumerate(urls):
+            if url.startswith(("http://", "https://")):
+                if all(
+                    score_cache.get(url, model_name) is not None
+                    for model_name, _ in models_to_run
+                ):
+                    fully_cached_indices.add(idx)
+        if fully_cached_indices:
+            logger.info(
+                f"Score cache: {len(fully_cached_indices)}/{len(urls)} URL(s) "
+                f"fully cached for all selected models — skipping download"
+            )
+
+    preloaded = await _preload_images(urls, skip_indices=fully_cached_indices)
+
+    # Run each selected model
     falconsai_results = None
     freepik_results = None
     private_detector_results = None
 
-    if model_selection in ("all", "falconsai"):
-        logger.info("Running Falconsai model classification...")
-        falconsai_results = await classify_batch_generic(urls, classifier_falconsai, MODEL_FALCONSAI, preloaded)
-
-    if model_selection in ("all", "freepik"):
-        logger.info("Running Freepik model classification...")
-        freepik_results = await classify_batch_generic(urls, classifier_freepik, MODEL_FREEPIK, preloaded)
-
-    if model_selection in ("all", "private-detector"):
-        logger.info("Running Private Detector model classification...")
-        private_detector_results = await classify_batch_generic(urls, classifier_private_detector, MODEL_PRIVATE_DETECTOR, preloaded)
+    for model_name, pipeline in models_to_run:
+        logger.info(f"Running {model_name} model classification...")
+        results = await classify_batch_generic(urls, pipeline, model_name, preloaded)
+        if model_name == MODEL_FALCONSAI:
+            falconsai_results = results
+        elif model_name == MODEL_FREEPIK:
+            freepik_results = results
+        elif model_name == MODEL_PRIVATE_DETECTOR:
+            private_detector_results = results
 
     return falconsai_results, freepik_results, private_detector_results
 
@@ -632,8 +676,7 @@ async def classify_category(category: str, limit: int = 10, model: str = "all"):
         return f"No files found in category: {category}"
 
     urls = [file_info["url"] for file_info in category_files]
-    preloaded = await _preload_images(urls)
-    falconsai_results, freepik_results, private_detector_results = await _run_multi_model_classification(urls, model_lower, preloaded)
+    falconsai_results, freepik_results, private_detector_results = await _run_multi_model_classification(urls, model_lower)
 
     return _render_wikitext_table(
         caption=f"NSFW Classification Comparison for {category}",
@@ -664,8 +707,7 @@ async def classify_article(title: str, model: str = "all"):
         return f"No images found in article: {title}"
 
     urls = [file_info["url"] for file_info in article_files]
-    preloaded = await _preload_images(urls)
-    falconsai_results, freepik_results, private_detector_results = await _run_multi_model_classification(urls, model_lower, preloaded)
+    falconsai_results, freepik_results, private_detector_results = await _run_multi_model_classification(urls, model_lower)
 
     return _render_wikitext_table(
         caption=f"NSFW Classification for article: {title}",
