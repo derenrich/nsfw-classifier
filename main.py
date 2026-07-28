@@ -689,11 +689,13 @@ async def classify_category(category: str, limit: int = 10, model: str = "all"):
 
 
 @app.get("/classify-article", response_class=PlainTextResponse)
-async def classify_article(title: str, model: str = "all"):
+async def classify_article(title: str, limit: int = None, model: str = "all"):
     """
     Fetches all images embedded in an English Wikipedia article, runs batch
     inference on the selected model(s), and returns results as a sortable
     MediaWiki wikitext table.
+
+    An optional *limit* restricts classification to the first N images.
     """
     model_lower = _validate_model_param(model)
 
@@ -705,6 +707,9 @@ async def classify_article(title: str, model: str = "all"):
 
     if not article_files:
         return f"No images found in article: {title}"
+
+    if limit is not None and limit > 0:
+        article_files = article_files[:limit]
 
     urls = [file_info["url"] for file_info in article_files]
     falconsai_results, freepik_results, private_detector_results = await _run_multi_model_classification(urls, model_lower)
