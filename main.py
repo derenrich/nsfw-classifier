@@ -9,6 +9,7 @@ import torch
 from transformers import pipeline
 
 from cache import ScoreCache
+from archive import ImageArchive, fetch_attribution
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -83,6 +84,18 @@ if SCORE_CACHE_DB:
 else:
     score_cache = None
     logger.info("Score cache is disabled (SCORE_CACHE_DB not set)")
+
+# ---------------------------------------------------------------------------
+# Image archive  —  controlled by IMAGE_ARCHIVE_PATH env var
+# ---------------------------------------------------------------------------
+IMAGE_ARCHIVE_PATH = os.getenv("IMAGE_ARCHIVE_PATH", "")
+if IMAGE_ARCHIVE_PATH:
+    image_archive: Optional[ImageArchive] = ImageArchive(IMAGE_ARCHIVE_PATH)
+    if image_archive._disabled:
+        image_archive = None
+else:
+    image_archive = None
+    logger.info("Image archive is disabled (IMAGE_ARCHIVE_PATH not set)")
 
 class ClassificationResult(BaseModel):
     file_path: str
@@ -220,6 +233,27 @@ def load_image(path_or_url: str) -> Image.Image:
         if not os.path.exists(container_path):
             raise FileNotFoundError(f"File not found on container system (mapped from: {path_or_url})")
         return Image.open(container_path).convert("RGB")
+
+
+def _download_image_bytes(url: str) -> bytes:
+    """Download a remote image URL and return raw bytes.
+
+    Respects the shared ``external_image_limiter`` rate limiter.  Unlike
+    ``load_image``, this does **not** decode the image — it returns the
+    raw bytes so they can be written directly to the archive.
+    """
+    import urllib.request
+
+    external_image_limiter.acquire()
+    logger.info(f"Downloading image bytes for archive: {url}")
+    req = urllib.request.Request(
+        url,
+        headers={
+            'User-Agent': 'NSFWClassifierBot/1.0 (https://github.com/derenrich/nsfw-classifier; info@nsfw-classifier.local)'
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return response.read()
 
 async def classify_batch_generic(
     path_or_urls: List[str],
@@ -409,11 +443,16 @@ def fetch_category_images(category_name: str, limit: int, thumb_width: int = 400
     # API query results can sometimes exceed our limit if generator returns slightly more items
     return results[:limit]
 
-def fetch_article_images(article_title: str, thumb_width: int = 400) -> List[Dict[str, str]]:
+def fetch_article_images(
+    article_title: str, thumb_width: int = 400
+) -> tuple:
     """
     Queries the Wikipedia REST API media-list endpoint to get all images
-    embedded in an English Wikipedia article.  Returns a list of dicts with
-    ``title`` (the ``File:`` page title) and ``url`` (a thumbnail URL).
+    embedded in an English Wikipedia article.
+
+    Returns ``(image_list, raw_response)`` where *image_list* is a list of
+    dicts with ``title`` (the ``File:`` page title) and ``url`` (a thumbnail
+    URL), and *raw_response* is the full parsed JSON from the API.
 
     Uses a policy-compliant User-Agent.
     """
@@ -466,7 +505,7 @@ def fetch_article_images(article_title: str, thumb_width: int = 400) -> List[Dic
         if title:
             results.append({"title": title, "url": url})
 
-    return results
+    return results, data
 
 # ---------------------------------------------------------------------------
 # Shared helpers for multi-model classification + wikitext rendering
@@ -700,7 +739,7 @@ async def classify_article(title: str, limit: int = None, model: str = "all"):
     model_lower = _validate_model_param(model)
 
     try:
-        article_files = fetch_article_images(title)
+        article_files, _raw = fetch_article_images(title)
     except Exception as e:
         logger.error(f"Wikipedia media-list API query failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch article images from Wikipedia: {str(e)}")
@@ -722,6 +761,103 @@ async def classify_article(title: str, limit: int = None, model: str = "all"):
         freepik_results=freepik_results,
         private_detector_results=private_detector_results,
     )
+
+
+@app.get("/archive-article")
+async def archive_article(title: str, limit: int = None):
+    """
+    Downloads and archives all images from an English Wikipedia article,
+    along with attribution metadata.  Skips images that are already archived.
+
+    Returns a JSON summary of what was archived, skipped, and failed.
+    """
+    if image_archive is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Image archive is not configured. Set IMAGE_ARCHIVE_PATH to enable.",
+        )
+
+    # Fetch the media list from Wikipedia
+    try:
+        article_files, raw_response = fetch_article_images(title)
+    except Exception as e:
+        logger.error(f"Wikipedia media-list API query failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch article images from Wikipedia: {str(e)}",
+        )
+
+    # Persist the raw media-list response (always overwrite to capture edits)
+    image_archive.save_media_list(title, raw_response)
+
+    if not article_files:
+        return {"title": title, "total": 0, "archived": 0, "skipped": 0, "failed": 0}
+
+    if limit is not None and limit > 0:
+        article_files = article_files[:limit]
+
+    import asyncio
+    import io
+    import urllib.request
+
+    loop = asyncio.get_running_loop()
+    archived = 0
+    skipped = 0
+    failed = 0
+
+    for item in article_files:
+        url = item["url"]
+        file_title = item["title"]
+
+        # Skip if already archived
+        if image_archive.has_image(url):
+            skipped += 1
+            image_archive.record_skipped()
+            continue
+
+        # Download the image (respects the existing rate limiter)
+        try:
+            img_bytes = await loop.run_in_executor(None, _download_image_bytes, url)
+        except Exception as e:
+            logger.error(f"Failed to download image for archive: {e} (URL: {url})")
+            failed += 1
+            image_archive.record_failed()
+            continue
+
+        # Save image
+        try:
+            image_archive.save_image(url, img_bytes)
+        except Exception as e:
+            logger.error(f"Failed to save image to archive: {e} (URL: {url})")
+            failed += 1
+            image_archive.record_failed()
+            continue
+
+        # Fetch and save attribution
+        try:
+            attribution = await loop.run_in_executor(None, fetch_attribution, file_title)
+            if attribution is not None:
+                image_archive.save_attribution(url, attribution)
+            else:
+                logger.warning(f"No attribution data for {file_title}")
+        except Exception as e:
+            logger.warning(f"Failed to save attribution for {file_title}: {e}")
+
+        archived += 1
+        image_archive.record_archived()
+
+    logger.info(
+        f"Archive complete for '{title}': "
+        f"{archived} archived, {skipped} skipped, {failed} failed"
+    )
+
+    return {
+        "title": title,
+        "total": len(article_files),
+        "archived": archived,
+        "skipped": skipped,
+        "failed": failed,
+    }
 
 @app.get("/health")
 async def health():
@@ -746,6 +882,16 @@ async def health():
         }
     else:
         health_payload["score_cache"] = {"enabled": False}
+    if image_archive is not None:
+        health_payload["image_archive"] = {
+            "enabled": True,
+            "path": image_archive.base_path,
+            "archived": image_archive.archived,
+            "skipped": image_archive.skipped,
+            "failed": image_archive.failed,
+        }
+    else:
+        health_payload["image_archive"] = {"enabled": False}
     return health_payload
 
 @app.get("/benchmark")

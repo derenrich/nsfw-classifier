@@ -22,12 +22,16 @@ services:
       - CONTAINER_DATASET_PATH=/datasets
       # SQLite score cache (set to empty string to disable)
       - SCORE_CACHE_DB=${SCORE_CACHE_DB:-/app/cache/scores.db}
+      # Image archive path (set to empty string to disable)
+      - IMAGE_ARCHIVE_PATH=${IMAGE_ARCHIVE_PATH:-/app/archive}
     volumes:
       # Maps the host's dataset directory to the container path /datasets
       # Using interpolation ${HOST_DATASET_PATH} with fallback so it can be set in an .env file
       - ${HOST_DATASET_PATH:-/home/user/my_datasets}:/datasets
       # Persistent volume for the score cache database
       - nsfw-cache:/app/cache
+      # Persistent volume for the image archive (may grow to many GBs)
+      - nsfw-archive:/app/archive
     deploy:
       resources:
         reservations:
@@ -39,6 +43,7 @@ services:
 
 volumes:
   nsfw-cache:
+  nsfw-archive:
 
 secrets:
   HF_TOKEN:

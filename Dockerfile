@@ -34,10 +34,10 @@ pipeline('image-classification', model='derenrich/private_detector_hf', trust_re
 "
 
 # Copy the application code
-COPY main.py cache.py ./
+COPY main.py cache.py archive.py ./
 
 # Create default cache directory (writable even without a volume mount)
-RUN mkdir -p /app/cache
+RUN mkdir -p /app/cache /app/archive
 
 # Expose port 8000
 EXPOSE 8000
