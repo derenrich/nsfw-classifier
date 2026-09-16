@@ -83,17 +83,52 @@ def _md5_hash_dirs(name: str) -> str:
     return f"{h[0]}/{h[:2]}"
 
 
+def _truncate_component(name: str, max_bytes: int = 200) -> str:
+    """Truncate a path component if its UTF-8 byte length exceeds max_bytes,
+    appending an MD5 hash of the original component to prevent collisions
+    and preserve filesystem limits (e.g. ZFS / POSIX 255-byte component limit).
+    """
+    encoded = name.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return name
+
+    h = hashlib.md5(encoded).hexdigest()[:8]
+
+    ext = ""
+    if "." in name:
+        base, extension = name.rsplit(".", 1)
+        if len(extension) <= 15 and "/" not in extension:
+            ext = "." + extension
+            stem = base
+        else:
+            stem = name
+    else:
+        stem = name
+
+    suffix = f"_{h}{ext}"
+    suffix_bytes = len(suffix.encode("utf-8"))
+    target_stem_bytes = max(1, max_bytes - suffix_bytes)
+
+    stem_bytes = stem.encode("utf-8")[:target_stem_bytes]
+    truncated_stem = stem_bytes.decode("utf-8", errors="ignore")
+
+    return f"{truncated_stem}{suffix}"
+
+
 def _url_to_relative_path(url: str) -> str:
     """Convert a Wikimedia upload URL to a relative filesystem path.
 
     E.g. ``https://upload.wikimedia.org/wikipedia/commons/thumb/e/ee/Foo.svg/250px-Foo.svg.png``
     → ``wikipedia/commons/thumb/e/ee/Foo.svg/250px-Foo.svg.png``
+
+    Truncates long path components to prevent ZFS/POSIX file length errors.
     """
     parsed = urllib.parse.urlparse(url)
-    # Strip leading slash
     path = parsed.path.lstrip("/")
-    # URL-decode (e.g. %28 → '(')
-    return urllib.parse.unquote(path)
+    decoded = urllib.parse.unquote(path)
+    components = [c for c in decoded.split("/") if c]
+    truncated = [_truncate_component(c, max_bytes=200) for c in components]
+    return os.path.join(*truncated)
 
 
 def _safe_filename(title: str) -> str:
@@ -171,6 +206,98 @@ def fetch_attribution(file_title: str) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# File Resolution (Special:FilePath, File: titles, Wikimedia URLs)
+# ---------------------------------------------------------------------------
+
+def resolve_file_info(
+    input_str: str, width: int = 960
+) -> tuple[str, Optional[str]]:
+    """Resolves an input string (Special:FilePath URL, File title, Wikimedia URL, etc.)
+    to a canonical 'File:...' title and a thumbnail URL at the requested width.
+
+    Returns (canonical_title, thumb_url).
+    """
+    input_str = input_str.strip()
+    file_title = None
+
+    if "Special:FilePath/" in input_str:
+        filename = (
+            input_str.split("Special:FilePath/")[-1]
+            .split("?")[0]
+            .split("#")[0]
+        )
+        filename = urllib.parse.unquote(filename).replace("_", " ")
+        file_title = f"File:{filename}"
+    elif input_str.startswith(("http://", "https://")):
+        parsed = urllib.parse.urlparse(input_str)
+        path = urllib.parse.unquote(parsed.path)
+        if "/wiki/" in path:
+            filename = path.split("/wiki/")[-1].replace("_", " ")
+            if filename.lower().startswith("special:filepath/"):
+                filename = filename.split("/")[-1]
+            file_title = (
+                filename
+                if filename.lower().startswith("file:")
+                else f"File:{filename}"
+            )
+        elif "/thumb/" in path:
+            parts = path.split("/thumb/")[1].split("/")
+            if len(parts) >= 3:
+                filename = parts[2].replace("_", " ")
+                file_title = f"File:{filename}"
+        elif "/wikipedia/" in path:
+            parts = [p for p in path.split("/") if p]
+            if len(parts) >= 1:
+                filename = parts[-1].replace("_", " ")
+                file_title = f"File:{filename}"
+
+    if not file_title:
+        clean = input_str.replace("_", " ")
+        if not clean.lower().startswith("file:"):
+            file_title = f"File:{clean}"
+        else:
+            file_title = clean
+
+    # Format file_title properly
+    file_title = "File:" + file_title[5:].strip()
+
+    # Query Commons API first, then English Wikipedia API as fallback
+    for site in ["https://commons.wikimedia.org", "https://en.wikipedia.org"]:
+        params = {
+            "action": "query",
+            "titles": file_title,
+            "prop": "imageinfo",
+            "iiprop": "url",
+            "iiurlwidth": str(width),
+            "format": "json",
+        }
+        api_url = f"{site}/w/api.php?" + urllib.parse.urlencode(params)
+        body = _fetch_with_retries(api_url, max_retries=2, timeout=10)
+        if body:
+            try:
+                data = json.loads(body.decode("utf-8"))
+                pages = data.get("query", {}).get("pages", {})
+                for pageid, pageinfo in pages.items():
+                    if int(pageid) > 0 and "imageinfo" in pageinfo:
+                        ii = pageinfo["imageinfo"][0]
+                        thumb_url = ii.get("thumburl") or ii.get("url")
+                        if thumb_url:
+                            thumb_url = thumb_url.split("?")[0]
+                            if thumb_url.startswith("//"):
+                                thumb_url = "https:" + thumb_url
+                            canonical_title = pageinfo.get("title", file_title)
+                            return canonical_title, thumb_url
+            except (json.JSONDecodeError, ValueError, KeyError):
+                pass
+
+    # Fallback if API lookup failed but input was already a valid image URL
+    if input_str.startswith(("http://", "https://")) and "/upload.wikimedia.org/" in input_str:
+        return file_title, input_str
+
+    return file_title, None
+
+
+# ---------------------------------------------------------------------------
 # ImageArchive
 # ---------------------------------------------------------------------------
 
@@ -216,8 +343,9 @@ class ImageArchive:
     def _media_list_path(self, article_title: str) -> str:
         safe = _safe_filename(article_title)
         bucket = _md5_hash_dirs(safe)
+        filename = _truncate_component(f"{safe}.json", max_bytes=200)
         return os.path.join(
-            self.base_path, "media-lists", bucket, f"{safe}.json"
+            self.base_path, "media-lists", bucket, filename
         )
 
     def save_media_list(

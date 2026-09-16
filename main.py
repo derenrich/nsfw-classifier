@@ -9,7 +9,7 @@ import torch
 from transformers import pipeline
 
 from cache import ScoreCache
-from archive import ImageArchive, fetch_attribution
+from archive import ImageArchive, fetch_attribution, resolve_file_info
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -858,6 +858,103 @@ async def archive_article(title: str, limit: int = None):
         "skipped": skipped,
         "failed": failed,
     }
+
+
+@app.get("/archive-file")
+async def archive_file(
+    file: Optional[str] = None,
+    url: Optional[str] = None,
+    title: Optional[str] = None,
+    width: int = 960,
+):
+    """
+    Downloads and archives a single image file given a file title, Special:FilePath URL,
+    or Wikimedia upload URL.  Converts inputs to a thumbnail URL at the requested width (default: 960).
+
+    Returns a JSON summary indicating if the file was archived or skipped.
+    """
+    target = file or url or title
+    if not target:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing required query parameter: 'file', 'url', or 'title'.",
+        )
+
+    if image_archive is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Image archive is not configured. Set IMAGE_ARCHIVE_PATH to enable.",
+        )
+
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+
+    # Resolve file input to canonical title and thumbnail URL at requested width
+    canonical_title, thumb_url = await loop.run_in_executor(
+        None, resolve_file_info, target, width
+    )
+
+    if not thumb_url:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Could not resolve thumbnail URL for: {target}",
+        )
+
+    # Check if already archived
+    if image_archive.has_image(thumb_url):
+        image_archive.record_skipped()
+        return {
+            "input": target,
+            "title": canonical_title,
+            "url": thumb_url,
+            "status": "skipped",
+            "reason": "already archived",
+        }
+
+    # Download raw image bytes
+    try:
+        img_bytes = await loop.run_in_executor(
+            None, _download_image_bytes, thumb_url
+        )
+    except Exception as e:
+        image_archive.record_failed()
+        logger.error(f"Failed to download image for archive: {e} (URL: {thumb_url})")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to download image: {str(e)}"
+        )
+
+    # Save image
+    try:
+        image_archive.save_image(thumb_url, img_bytes)
+    except Exception as e:
+        image_archive.record_failed()
+        logger.error(f"Failed to save image to archive: {e} (URL: {thumb_url})")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to save image to archive: {str(e)}"
+        )
+
+    # Fetch and save attribution metadata
+    try:
+        attribution = await loop.run_in_executor(
+            None, fetch_attribution, canonical_title
+        )
+        if attribution is not None:
+            image_archive.save_attribution(thumb_url, attribution)
+        else:
+            logger.warning(f"No attribution data for {canonical_title}")
+    except Exception as e:
+        logger.warning(f"Failed to save attribution for {canonical_title}: {e}")
+
+    image_archive.record_archived()
+
+    return {
+        "input": target,
+        "title": canonical_title,
+        "url": thumb_url,
+        "status": "archived",
+    }
+
 
 @app.get("/health")
 async def health():
