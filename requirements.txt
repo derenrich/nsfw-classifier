@@ -3,5 +3,5 @@ uvicorn[standard]
 pydantic
 torch
 transformers
-pillow
+pillow==13.0.0
 timm
