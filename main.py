@@ -764,10 +764,13 @@ async def classify_article(title: str, limit: int = None, model: str = "all"):
 
 
 @app.get("/archive-article")
-async def archive_article(title: str, limit: int = None):
+async def archive_article(title: str, limit: int = None, source: Optional[str] = None):
     """
     Downloads and archives all images from an English Wikipedia article,
     along with attribution metadata.  Skips images that are already archived.
+
+    The optional 'source' parameter is recorded in the attribution metadata to
+    identify the caller or dataset that caused the archive.
 
     Returns a JSON summary of what was archived, skipped, and failed.
     """
@@ -837,7 +840,7 @@ async def archive_article(title: str, limit: int = None):
         try:
             attribution = await loop.run_in_executor(None, fetch_attribution, file_title)
             if attribution is not None:
-                image_archive.save_attribution(url, attribution)
+                image_archive.save_attribution(url, attribution, source=source)
             else:
                 logger.warning(f"No attribution data for {file_title}")
         except Exception as e:
@@ -866,10 +869,14 @@ async def archive_file(
     url: Optional[str] = None,
     title: Optional[str] = None,
     width: int = 960,
+    source: Optional[str] = None,
 ):
     """
     Downloads and archives a single image file given a file title, Special:FilePath URL,
     or Wikimedia upload URL.  Converts inputs to a thumbnail URL at the requested width (default: 960).
+
+    The optional 'source' parameter is recorded in the attribution metadata to
+    identify the caller or dataset that caused the archive.
 
     Returns a JSON summary indicating if the file was archived or skipped.
     """
@@ -940,7 +947,7 @@ async def archive_file(
             None, fetch_attribution, canonical_title
         )
         if attribution is not None:
-            image_archive.save_attribution(thumb_url, attribution)
+            image_archive.save_attribution(thumb_url, attribution, source=source)
         else:
             logger.warning(f"No attribution data for {canonical_title}")
     except Exception as e:

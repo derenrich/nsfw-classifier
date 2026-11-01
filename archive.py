@@ -411,13 +411,20 @@ class ImageArchive:
         return os.path.exists(self._attribution_path(url))
 
     def save_attribution(
-        self, url: str, attribution: Dict[str, Any]
+        self, url: str, attribution: Dict[str, Any], source: Optional[str] = None
     ) -> None:
-        """Write gzipped attribution JSON alongside the image."""
+        """Write gzipped attribution JSON alongside the image.
+
+        If ``source`` is given, it is recorded in the JSON as a ``source``
+        field. It identifies the caller or dataset that caused the archive.
+        """
         path = self._attribution_path(url)
+        payload = attribution
+        if source:
+            payload = {**attribution, "source": source}
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with gzip.open(path, "wt", encoding="utf-8") as f:
-            json.dump(attribution, f, ensure_ascii=False)
+            json.dump(payload, f, ensure_ascii=False)
 
     # ------------------------------------------------------------------
     # Stats helpers
